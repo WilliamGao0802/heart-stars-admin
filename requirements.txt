@@ -1,0 +1,4 @@
+# 心与星寻 · 管理者网站依赖
+streamlit>=1.40
+requests>=2.31
+pandas>=2.0
