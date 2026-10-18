@@ -7,12 +7,16 @@
   总览       KPI 卡片 + 注册趋势 + 数据分布 + 最近动态
   用户管理   搜索 / 排序 / 全量导出 CSV / 点进单个用户
   用户详情   账号、资料、长期记忆、对话记录、日记、路灯
-  警报中心   极端内容上报（高亮关键词），支持导出
+  校方视图   只出聚合数、不含个人级内容（P12 师生隔离），可导出给老师
+  警报中心   危机台账：触发→响应→转介→关闭 四状态 + 时间线 + 导出
   回应库     小程序端 116 条陪伴文案，按情绪/话题筛选
   系统自检   接口连通性 + 各表读数 + 密钥校验
 """
 
+import hmac
+import html as html_lib
 import os
+import time
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -20,40 +24,153 @@ import streamlit as st
 
 from core.admin import AdminAPI, AdminError
 
-VERSION = "1.0.0"
+VERSION = "1.2.0"
+
+
+# ============================ 输出转义 ============================
+#
+# 后台会把**用户原文**（对话、日记、警报）贴进 HTML 卡片里。如果直接插，
+# 用户只要发一条 `<img src=x onerror=...>` 就能在管理员浏览器里执行脚本 ——
+# 这是典型的存储型 XSS，且攻击者不需要任何账号权限。
+# 所以：凡是进 unsafe_allow_html 的用户数据，一律先过 _esc()。
+
+def _esc(v, br=True):
+    t = html_lib.escape(str(v if v is not None else ''), quote=True)
+    return t.replace('\n', '<br>') if br else t
+
+
+# CSV 公式注入：Excel/Sheets 会把 = + - @ 开头的单元格当公式执行。
+#   导出的表是给管理员看的，一旦被当成公式，轻则错乱，重则外连取数。
+_RISKY_PREFIX = ('=', '+', '-', '@', '\t', '\r')
+
+
+def _csv_safe(df):
+    def fix(v):
+        if isinstance(v, str) and v[:1] in _RISKY_PREFIX:
+            return "'" + v
+        return v
+    return df.apply(lambda col: col.map(fix) if hasattr(col, 'map') else col.apply(fix))
 
 
 # ============================ 登录 ============================
+#
+# 安全约定（v1.0.1 起，务必遵守）：
+#   · 代码里**不再有任何默认口令**。缺配置就直接拒绝进入，而不是退化成弱口令。
+#   · 口令只从 Streamlit Secrets / 环境变量读取，绝不写进仓库。
+#   · 登录失败有递增锁定；登录成功有 30 分钟闲置超时。
+#   · 比较用 hmac.compare_digest（定长比较，避免按字符早退泄露长度信息）。
 
-# 内置口令（本工程既定值）。生产环境可在 Streamlit Secrets 的 [admin] 段覆盖。
-DEFAULT_PWD = "gld20080802"
-DEFAULT_KEY = "gld20080802"
+MAX_TRIES = 5                 # 连续失败 5 次后开始锁定
+LOCK_BASE_SEC = 60            # 首次锁 60 秒，之后翻倍
+IDLE_TIMEOUT_SEC = 30 * 60    # 闲置 30 分钟自动登出
+
+MISSING_CREDS_HINT = (
+    "未配置管理员凭据。请在 `.streamlit/secrets.toml`（本地）或 Streamlit Cloud 的 Secrets（线上）"
+    "里填写 `[admin]` 段的 email / password / db_key，然后重启应用。"
+)
+
+
+def _sec():
+    try:
+        return dict(st.secrets.get("admin", {}))
+    except Exception:
+        return {}
 
 
 def _creds():
-    sec = {}
+    """返回 (email, password, db_key)；任一缺失返回 (None, None, None)。"""
+    sec = _sec()
+    email = sec.get("email") or os.environ.get("HSX_ADMIN_EMAIL")
+    pwd = sec.get("password") or os.environ.get("HSX_ADMIN_PASSWORD")
+    key = sec.get("db_key") or os.environ.get("HSX_ADMIN_KEY")
+    if not (email and pwd and key):
+        return None, None, None
+    return str(email), str(pwd), str(key)
+
+
+def _safe_eq(a, b):
+    """定长比较：长度不同也走一次比较，避免计时侧信道。"""
+    return hmac.compare_digest(str(a).encode("utf-8"), str(b).encode("utf-8"))
+
+
+# 失败计数必须放在**进程级**，不能只放 session_state。
+#   原因：st.session_state 是按浏览器会话隔离的，攻击者清一下 cookie / 开个无痕窗口，
+#   计数就归零了 —— 「5 次失败锁 60 秒」等于没锁，可以无限撞库。
+#   这里用 st.cache_resource 拿一个跨会话共享的 dict，并按来源 IP 分桶。
+@st.cache_resource
+def _fail_store():
+    return {"by_ip": {}, "global": {"fails": 0, "until": 0.0}}
+
+
+def _client_key():
+    """来源 IP（拿不到就退化成全局桶）。"""
     try:
-        sec = dict(st.secrets.get("admin", {}))
+        ip = getattr(st.context, "ip_address", "") or ""
+        return ip if isinstance(ip, str) and ip else "global"
     except Exception:
-        sec = {}
-    email = sec.get("email") or os.environ.get("HSX_ADMIN_EMAIL") or "admin@heart-stars.local"
-    pwd = sec.get("password") or os.environ.get("HSX_ADMIN_PASSWORD") or DEFAULT_PWD
-    key = sec.get("db_key") or os.environ.get("HSX_ADMIN_KEY") or DEFAULT_KEY
-    return email, pwd, key
+        return "global"
+
+
+def _bucket():
+    store = _fail_store()
+    k = _client_key()
+    if k == "global":
+        return store["global"]
+    return store["by_ip"].setdefault(k, {"fails": 0, "until": 0.0})
+
+
+def _lock_left():
+    b = _bucket()
+    left = float(b.get("until") or 0) - time.time()
+    return int(left) if left > 0 else 0
+
+
+def _record_failure():
+    b = _bucket()
+    b["fails"] = int(b.get("fails") or 0) + 1
+    n = b["fails"]
+    if n >= MAX_TRIES:
+        extra = n - MAX_TRIES
+        b["until"] = time.time() + LOCK_BASE_SEC * (2 ** min(extra, 5))
+
+
+def _clear_failures():
+    b = _bucket()
+    b["fails"] = 0
+    b["until"] = 0.0
 
 
 def _login_screen():
     st.markdown('<div class="hero"><h1>管理后台</h1><p>心与星寻 · 仅管理员可进</p></div>', unsafe_allow_html=True)
+    ok_email, ok_pwd, _ = _creds()
+    if not ok_email:
+        st.error(MISSING_CREDS_HINT)
+        st.stop()
+
     left, right = st.columns([1, 1.2])
     with left:
+        left_sec = _lock_left()
+        if left_sec:
+            st.warning("尝试次数过多，请 %d 秒后再试。" % left_sec)
         with st.form("admin_login"):
             email = st.text_input("管理员邮箱")
             pwd = st.text_input("密码", type="password")
-            if st.form_submit_button("进入", width="stretch"):
-                ok_email, ok_pwd, _ = _creds()
-                if email.strip().lower() == ok_email.lower() and pwd == ok_pwd:
-                    st.session_state.admin_ok = True
-                    st.rerun()
+            submitted = st.form_submit_button("进入", width="stretch",
+                                              disabled=bool(left_sec))
+        if submitted:
+            # 两个条件都算完再判断，失败信息统一，不透露"是邮箱错还是密码错"
+            email_ok = _safe_eq(email.strip().lower(), ok_email.lower())
+            pwd_ok = _safe_eq(pwd, ok_pwd)
+            if email_ok and pwd_ok:
+                _clear_failures()
+                st.session_state.admin_ok = True
+                st.session_state.admin_seen = time.time()
+                st.rerun()
+            else:
+                _record_failure()
+                left_sec = _lock_left()
+                if left_sec:
+                    st.error("邮箱或密码不对。已暂时锁定，请 %d 秒后再试。" % left_sec)
                 else:
                     st.error("邮箱或密码不对")
     with right:
@@ -62,15 +179,18 @@ def _login_screen():
                     '<p>· 查单个用户的资料、长期记忆与对话记录</p>'
                     '<p>· 接收极端内容警报，第一时间知道谁需要帮助</p>'
                     '<p>· 浏览小程序端 116 条陪伴文案</p></div>', unsafe_allow_html=True)
-        st.caption("账号密码已内置于应用；若想更稳妥，可在 Streamlit Secrets 的 [admin] 段覆盖，"
-                   "覆盖后立即生效（详见《Streamlit发布操作步骤.md》第 4 段）。")
+        st.caption("账号密码只从 Secrets 读取，不写在代码里。闲置 30 分钟会自动退出。")
 
 
 # ============================ 小工具 ============================
 
 def _api():
     if "admin_api" not in st.session_state:
-        st.session_state.admin_api = AdminAPI(_creds()[2])
+        key = _creds()[2]
+        if not key:
+            st.error(MISSING_CREDS_HINT)
+            st.stop()
+        st.session_state.admin_api = AdminAPI(key)
     return st.session_state.admin_api
 
 
@@ -92,6 +212,114 @@ def _fmt_dt(s):
 
 def _days_ago(n):
     return datetime.now().astimezone() - timedelta(days=n)
+
+
+# ============================ 周度看板 ============================
+# 数据源：analytics_events 埋点表（客户端 fire-and-forget 写入），admin_metrics RPC 聚合。
+# 指标口径与《生死线 03 数据埋点》一致：次日/7 日留存、周活跃、人均对话轮次、
+# 人均日记篇数、危机触发（分级）与转介闭环数。
+
+def _page_metrics(api):
+    """周度看板：严格按《马老师汇报》P9 的五个指标组织，外加 P14 的止损线。
+
+    为什么要把指标顺序钉死：汇报里这五个是**对外承诺**的测量口径，
+    老师会拿着这张表问「现在的数是多少」。所以页面结构必须与 PPT 一一对应，
+    不能按"好看"重排，也不能偷偷换口径（换口径 = 换承诺）。
+
+    主指标是「第 8 周主动周留存率」——注意是**主动**：一周内跨 ≥2 个不同日期
+    打开才算，一天里反复打开不算。这是我们跟老师说过的定义，看板上要写出来。
+    """
+    m, err = _run(api.metrics)
+    if err:
+        st.error("周度看板暂不可用：%s" % _esc(err))
+        st.caption("提示：需要云端已部署 admin_metrics RPC，且客户端已升级到带埋点的版本。")
+        return
+
+    st.subheader("周度看板")
+    st.caption("口径与《汇报》P9 的五个指标一一对应。改口径等于改对外承诺，"
+               "所以每一项下面都写清了分子分母。")
+
+    # ---------- 主指标 ----------
+    st.markdown("##### 主指标：主动周留存率（阈值 ≥ 25%）")
+    wr = m.get("week_retention", 0) or 0
+    base = m.get("week_retention_base", 0) or 0
+    kept = m.get("week_retention_kept", 0) or 0
+    k1, k2, k3 = st.columns([1, 1, 2])
+    k1.metric("主动周留存", "%s%%" % wr)
+    k2.metric("上周活跃 / 本周主动回来", "%d / %d" % (base, kept))
+    with k3:
+        if base == 0:
+            st.caption("还没有满一周的 cohort——等第一周数据跑完再判断。")
+        elif wr >= 25:
+            st.success("达到阈值（≥25%%）：%s%%" % wr)
+        else:
+            st.warning("低于阈值（<25%%）：%s%% —— 按 P14 止损线要复盘留存，先别加大推广。" % wr)
+    st.caption("分子 = 本周跨 ≥2 个不同日期打开的人；分母 = 上周有过打开的人。"
+               "「主动」指跨天回来，一天里反复点开不算。")
+
+    # ---------- 其余四个指标 ----------
+    st.markdown("##### 指标 2–5")
+    c1, c2, c3, c4 = st.columns(4)
+    act = m.get("activation_7d", 0) or 0
+    c1.metric("首周激活率（止损线 <30%）", "%s%%" % act)
+    c2.metric("日均对话轮次", m.get("turns_per_day", 0))
+    c3.metric("情绪记录连续性（天/周）", m.get("diary_days", 0))
+    l2, l3 = m.get("crisis_l2_7d", 0) or 0, m.get("crisis_l3_7d", 0) or 0
+    c4.metric("安全事件（L2+L3，7 天）", l2 + l3)
+
+    st.caption(
+        "② 首周激活率 = 注册后 7 天内写过至少一篇日记的人 ÷ 满 7 天的 cohort（%d / %d）。"
+        "注意写日记不要求先登录，匿名期写的人不进分子——这是**偏保守**的口径。\n\n"
+        "③ 日均对话轮次 = 近 7 天 chat_turn 总数 ÷ 7。\n\n"
+        "④ 情绪记录连续性 = 本周写过日记的人，人均记录了几天（满分 7）。\n\n"
+        "⑤ 安全事件 = L2（求助卡片）+ L3（阻断页）触发次数。"
+        % (m.get("activation_kept", 0) or 0, m.get("activation_base", 0) or 0)
+    )
+
+    # ---------- 活跃与趋势 ----------
+    st.markdown("##### 活跃规模")
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("日活 DAU", m.get("dau", 0))
+    d2.metric("周活 WAU", m.get("wau", 0))
+    d3.metric("月活 MAU", m.get("mau", 0))
+    d4.metric("人均对话轮次（周）", m.get("avg_turns", 0))
+
+    plat = m.get("platforms") or {}
+    if plat:
+        order = ["h5", "mp", "app"]
+        names = {"h5": "网页 H5", "mp": "微信小程序", "app": "安卓 App", "unknown": "未标注"}
+        cols = st.columns(len(plat))
+        for i, k in enumerate(sorted(plat, key=lambda x: order.index(x) if x in order else 9)):
+            cols[i].metric(names.get(k, k), plat[k])
+        st.caption("近 7 天分端活跃人数——汇报里「三端都有量」就靠这一行。")
+
+    st.markdown("##### 每日活跃（近 14 天）")
+    series = m.get("trend") or []
+    if series:
+        df = pd.DataFrame(series).rename(columns={"d": "日期", "n": "活跃用户"})
+        df["日期"] = pd.to_datetime(df["日期"])
+        st.bar_chart(df.set_index("日期"))
+    else:
+        st.caption("还没有埋点数据——等客户端带埋点的版本上线后自动开始积累。")
+
+    # ---------- 安全闭环 + 台账 ----------
+    st.markdown("##### 安全事件与转介闭环（近 7 天）")
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("L2 触发（求助卡片）", l2)
+    a2.metric("L3 触发（阻断页）", l3)
+    a3.metric("转介动作总数", m.get("referral_7d", 0))
+    a4.metric("转介率", "%s%%" % (m.get("referral_rate", 0) or 0))
+    st.caption("转介率 = 转介动作数 ÷ (L2 + L3) 触发数。用户的转介动作是「点了哪个求助入口」，"
+               "不代表真的拨通了——真实跟进看下面的台账。")
+
+    st.markdown("##### 危机台账（P10：老师可随时抽查）")
+    t1, t2, t3 = st.columns(3)
+    t1.metric("未关闭（open/acked/referred）", m.get("alert_open", 0))
+    t2.metric("已关闭（closed）", m.get("alert_closed", 0))
+    t3.metric("响应时长中位数（分钟）", m.get("alert_median_minutes", 0))
+    st.caption("响应时长 = 从触发到「已响应」的中位数，只统计近 30 天且已响应的记录。"
+               "推进状态去「警报中心」——每条都能看到触发 → 响应 → 转介 → 关闭的时间线。")
+    st.caption("数据生成时间：%s" % _esc(m.get("generated_at", "-")))
 
 
 # ============================ 总览 ============================
@@ -193,7 +421,8 @@ def _page_users(api):
         st.session_state.admin_page = "用户详情"
         st.rerun()
 
-    st.download_button("导出全部用户 CSV", show.drop(columns=["选", "uid"]).to_csv(index=False).encode("utf-8-sig"),
+    st.download_button("导出全部用户 CSV",
+                       _csv_safe(show.drop(columns=["选", "uid"])).to_csv(index=False).encode("utf-8-sig"),
                        file_name="heart-stars-users.csv", mime="text/csv")
 
     st.divider()
@@ -236,7 +465,8 @@ def _page_detail(api):
     st.markdown('<div class="card"><h4>账号</h4>'
                 '<p class="kv">uid：%s</p><p class="kv">手机号：%s</p>'
                 '<p class="kv">注册：%s ｜ 最近登录：%s</p></div>'
-                % (uid, acc.get("phone") or "—", _fmt_dt(acc.get("created_at")), _fmt_dt(acc.get("last_login"))),
+                % (_esc(uid), _esc(acc.get("phone") or "—"),
+                   _esc(_fmt_dt(acc.get("created_at"))), _esc(_fmt_dt(acc.get("last_login")))),
                 unsafe_allow_html=True)
 
     t1, t2, t3, t4 = st.tabs(["资料", "长期记忆", "对话记录", "日记 / 周记"])
@@ -265,12 +495,12 @@ def _page_detail(api):
         for m in reversed(msgs):
             who = "用户" if m["role"] == "user" else "星寻"
             st.markdown('<div class="card"><p class="kv">%s ｜ %s</p><p>%s</p></div>'
-                        % (who, _fmt_dt(m.get("created_at")), m.get("content", "")),
+                        % (_esc(who), _esc(_fmt_dt(m.get("created_at"))), _esc(m.get("content", ""))),
                         unsafe_allow_html=True)
         if msgs:
             st.download_button("导出这位用户的对话 CSV",
-                               pd.DataFrame(msgs).to_csv(index=False).encode("utf-8-sig"),
-                               file_name="user-%s-chat.csv" % uid[:10], mime="text/csv")
+                               _csv_safe(pd.DataFrame(msgs)).to_csv(index=False).encode("utf-8-sig"),
+                               file_name="user-%s-chat.csv" % str(uid)[:10], mime="text/csv")
 
     with t4:
         diaries = d.get("diaries") or []
@@ -278,14 +508,16 @@ def _page_detail(api):
         st.markdown("**日记（蜡烛）**")
         for x in diaries:
             st.markdown('<div class="card"><p class="kv">%s ｜ %s</p><p>%s</p></div>'
-                        % (_fmt_dt(x.get("created_at")), x.get("source") or "write", x.get("content") or ""),
+                        % (_esc(_fmt_dt(x.get("created_at"))), _esc(x.get("source") or "write"),
+                           _esc(x.get("content") or "")),
                         unsafe_allow_html=True)
         if not diaries:
             st.caption("没有日记。")
         st.markdown("**周记（路灯）**")
         for x in lamps:
             st.markdown('<div class="card"><p class="kv">%s ｜ %s ｜ 本周 %s 条</p><p>%s</p></div>'
-                        % (_fmt_dt(x.get("created_at")), x.get("week_label") or "", x.get("week_count") or 0, x.get("content") or ""),
+                        % (_esc(_fmt_dt(x.get("created_at"))), _esc(x.get("week_label") or ""),
+                           _esc(x.get("week_count") or 0), _esc(x.get("content") or "")),
                         unsafe_allow_html=True)
         if not lamps:
             st.caption("没有周记。")
@@ -293,9 +525,39 @@ def _page_detail(api):
 
 # ============================ 警报中心 ============================
 
+ALERT_STATUS = {
+    "open": ("待响应", "#c0392b"),
+    "acked": ("已响应", "#d68910"),
+    "referred": ("已转介", "#2471a3"),
+    "closed": ("已关闭", "#1e8449"),
+}
+
+ALERT_NEXT = {
+    "open": [("acked", "标记已响应")],
+    "acked": [("referred", "标记已转介"), ("closed", "直接关闭")],
+    "referred": [("closed", "完成关闭")],
+    "closed": [],
+}
+
+REFERRAL_LABEL = {
+    "hotline": "12356 热线", "emergency": "120 紧急",
+    "school": "学校心理老师", "guardian": "监护人", "": "（未记录）",
+}
+
+
 def _page_alerts(api):
+    """警报中心：从「只读列表」升级成可以推进的台账。
+
+    为什么后台需要写能力：汇报 P7 承诺「每次 L2/L3 触发都留档」、P10 承诺
+    「触发→响应→转介→关闭 的时间线，老师可随时抽查」。只有一条 created_at
+    的记录不叫留档——必须有谁、什么时候、做了什么。
+
+    写库严格收口：只走 admin_alert_update 这一个 RPC，只改四个白名单字段，
+    时间戳由服务端落（客户端传时间可被伪造），已关闭的不可再改。
+    """
     st.markdown("### 警报中心")
-    st.caption("用户发出极端内容时（自杀 / 自残 / 极端言论），系统会立刻停止对话、不保存该条，并把账号与内容推到这里。")
+    st.caption("危机内容上报的台账。系统检测到 L2/L3 会立刻停止对话、不保存该条原文，"
+               "并把账号、原文与分级推到这里。这里也是这条记录从「触发」走到「关闭」的完整时间线。")
     alerts, err = _run(api.alerts)
     if err:
         st.error(err)
@@ -304,23 +566,112 @@ def _page_alerts(api):
 
     if not alerts:
         st.success("目前没有警报。")
+        st.caption("台账为空是好事，但也意味着还没有真实危机数据可用于检验流程——"
+                   "建议正式启动前做一次演练（写一条测试记录，走完四个状态，再删掉）。")
         return
 
     df = pd.DataFrame(alerts)
+    for col, default in (("status", "open"), ("handler", ""), ("note", ""), ("referral_path", "")):
+        if col not in df.columns:
+            df[col] = default
     df["时间"] = df["created_at"].apply(_fmt_dt)
     df["命中词"] = df["words"].apply(lambda s: "、".join([w for w in str(s).split(",") if w]))
-    st.error("有 %d 条警报需要关注" % len(df))
-    st.dataframe(df[["时间", "user_id", "source", "命中词", "content"]].rename(
-        columns={"user_id": "用户", "source": "来源", "content": "原话"}),
-        width="stretch", hide_index=True, height=380)
-    st.download_button("导出警报 CSV", df.to_csv(index=False).encode("utf-8-sig"),
+    df["分级"] = df["words"].apply(lambda s: str(s)[:2] if str(s)[:2] in ("L2", "L3") else "L2")
+    df["状态"] = df["status"].map(lambda k: ALERT_STATUS.get(k, (k, "#555"))[0])
+
+    pending = int((df["status"] != "closed").sum())
+    if pending:
+        st.error("有 %d 条未关闭（其中 %d 条还没人响应）"
+                 % (pending, int((df["status"] == "open").sum())))
+    else:
+        st.success("全部 %d 条警报都已关闭归档。" % len(df))
+
+    f1, f2, f3 = st.columns([1, 1, 2])
+    with f1:
+        ssel = st.selectbox("按状态筛选", ["全部", "待响应", "已响应", "已转介", "已关闭"])
+    with f2:
+        lsel = st.selectbox("按分级筛选", ["全部", "L3", "L2"])
+    with f3:
+        st.caption("L3 = 方式/计划/进行中（阻断页）；L2 = 明确表达（求助卡片）。"
+                   "命中词前缀就是分级编码，与客户端上报口径一致。")
+
+    view = df.copy()
+    if ssel != "全部":
+        view = view[view["状态"] == ssel]
+    if lsel != "全部":
+        view = view[view["分级"] == lsel]
+
+    st.dataframe(view[["时间", "分级", "状态", "user_id", "source", "命中词", "content", "handler", "note"]].rename(
+        columns={"user_id": "用户", "source": "来源", "content": "原话",
+                 "handler": "处理人", "note": "处置备注"}),
+        width="stretch", hide_index=True, height=320)
+    st.download_button("导出台账 CSV", _csv_safe(df.drop(columns=["words"], errors="ignore"))
+                       .to_csv(index=False).encode("utf-8-sig"),
                        file_name="heart-stars-alerts.csv", mime="text/csv")
 
-    st.markdown("#### 处置建议")
+    # ---------------- 单条推进 ----------------
+    st.markdown("#### 推进处置（逐条留痕）")
+    st.caption("选一条记录，按 触发 → 已响应 → 已转介 → 已关闭 推进。"
+               "时间戳由服务端自动记录，处理人和备注会一起写进台账。")
+
+    open_rows = [r for r in alerts if r.get("status") != "closed"]
+    if not open_rows:
+        st.info("所有记录都已关闭。已关闭的台账为归档，不能再改。")
+    else:
+        labels = {}
+        for r in open_rows:
+            lv = str(r.get("words") or "")[:2]
+            labels["#%s · %s · %s · %s" % (r.get("id"), lv, _fmt_dt(r.get("created_at")),
+                                           str(r.get("content") or "")[:18])] = r
+        pick = st.selectbox("选择要处理的记录", list(labels.keys()))
+        row = labels[pick]
+        cur = row.get("status") or "open"
+        st.markdown("当前状态：**%s**　｜　命中词：`%s`"
+                    % (ALERT_STATUS.get(cur, (cur, ""))[0], _esc(row.get("words") or "-")))
+
+        # 时间线
+        tl = [("触发", row.get("created_at")), ("已响应", row.get("acked_at")),
+              ("已转介", row.get("referred_at")), ("已关闭", row.get("closed_at"))]
+        st.markdown(" · ".join(["**%s** %s" % (n, _fmt_dt(t) if t else "—") for n, t in tl]))
+
+        with st.form("alert_advance"):
+            c1, c2 = st.columns(2)
+            handler = c1.text_input("处理人", value=row.get("handler") or "",
+                                    placeholder="例如：马老师 / 研究者（本人）")
+            path = c2.selectbox("转介去向（转介时填）", list(REFERRAL_LABEL.keys()),
+                                index=list(REFERRAL_LABEL.keys()).index(
+                                    row.get("referral_path") or ""))
+            note = st.text_area("处置备注", value=row.get("note") or "",
+                                placeholder="做了什么、对方怎么回应、下一步。这段会同步写入台账。",
+                                height=90)
+            opts = ALERT_NEXT.get(cur, [])
+            target = st.selectbox("推进到", [t for t, _ in opts] or ["（已关闭，不可再改）"],
+                                  format_func=lambda k: dict(opts).get(k, k))
+            ok = st.form_submit_button("提交", type="primary",
+                                       disabled=(not opts or not handler.strip()))
+
+        if not opts:
+            st.caption("这条已经关闭了。需要修改结论的话，请在别处留一份说明——台账本身不抹改。")
+        elif not handler.strip():
+            st.caption("提交前请填「处理人」——台账要能回答「谁处理了这个警报」。")
+
+        if ok and opts and handler.strip():
+            res, rerr = _run(lambda: api.alert_update(row.get("id"), target,
+                                                      handler.strip(), note.strip(), path))
+            if rerr:
+                st.error("提交失败：%s" % rerr)
+            else:
+                st.success("已更新为「%s」。刷新后可在时间线里看到。" % ALERT_STATUS[target][0])
+                st.rerun()
+
+    st.markdown("#### 处置原则（与《危机响应 SOP》一致）")
     st.markdown('<div class="card">'
-                '<p>1. 如果这条警报来自一个已知账号，先看他的「用户详情」里的对话记录，判断是即时风险还是长期状态。</p>'
-                '<p>2. 系统已经给用户看过安全回应（含 12356 与 120），但**真人跟进不可替代**。</p>'
-                '<p>3. 记录处置结果（本后台不写库，避免误改线上数据）。</p></div>',
+                '<p>1. <b>先看分级</b>：L3 是方式/计划/正在受伤害，优先级最高，先确认人是否安全，再谈其他。</p>'
+                '<p>2. <b>不自行判断严重程度</b>：研究者不做临床判断，触发即按流程走；是否严重由专业人员判断。</p>'
+                '<p>3. <b>告知优先</b>：L2/L3 按流程告知监护人（研究者经手）；L3 同时告知指导教师。</p>'
+                '<p>4. <b>每一步都留痕</b>：处理人、时间、转介去向、对方回应，全部写进备注——这是老师抽查的依据。</p>'
+                '<p>5. <b>关闭有条件</b>：确认当事人已获得真人支持（热线/学校/家长三者之一）才关闭；'
+                '只知道「他点了热线按钮」不算。</p></div>',
                 unsafe_allow_html=True)
 
 
@@ -386,7 +737,93 @@ def _page_health(api):
 
 # ============================ 入口 ============================
 
-PAGES = ["总览", "用户管理", "用户详情", "警报中心", "回应库", "系统自检"]
+PAGES = ["总览", "周度看板", "校方视图", "用户管理", "用户详情", "警报中心", "回应库", "系统自检"]
+
+
+# ============================ 校方视图（P12：师生物理隔离）============================
+#
+# 汇报 P12 的原话是「师生版本分开，给老师看的报告看不到个人级内容」。
+# 这条承诺不能只写在 PPT 里——后台必须真的存在一个**只出聚合数**的视图，
+# 而且它能被单独截图/导出给老师看。
+#
+# 实现上不是"权限开关"而是"另一套数据源"：校方视图不调用任何带 user_id 的接口，
+# 只调 admin_metrics（纯聚合）与 admin_alerts_list 的**计数**（不展示原文）。
+# 这样即使有人误操作，也不可能在这个页面上把某个学生的日记翻出来——
+# 物理隔离的意思是：路径不存在，而不是"有权限但没点"。
+
+def _page_school(api):
+    m, err = _run(api.metrics)
+    if err:
+        st.error("数据暂不可用：%s" % _esc(err))
+        return
+
+    st.markdown("### 校方 / 导师视图")
+    st.caption("本页只呈现聚合数据与流程执行情况，**不包含任何个人级内容**"
+               "（对话原文、日记内容、账号标识一律不出现）。可直接截图作为阶段性汇报材料。")
+
+    st.markdown("#### 一、使用规模（近 7 天）")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("周活跃用户数", m.get("wau", 0))
+    c2.metric("月活跃用户数", m.get("mau", 0))
+    c3.metric("人均对话轮次", m.get("avg_turns", 0))
+    plat = m.get("platforms") or {}
+    if plat:
+        names = {"h5": "网页", "mp": "小程序", "app": "安卓 App", "unknown": "未标注"}
+        st.markdown("客户端分布：" + "　".join(
+            ["%s **%d 人**" % (names.get(k, k), v) for k, v in plat.items()]))
+
+    st.markdown("#### 二、五个研究指标（与 P9 一致）")
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("主动周留存率", "%s%%" % (m.get("week_retention", 0) or 0))
+    d2.metric("首周激活率", "%s%%" % (m.get("activation_7d", 0) or 0))
+    d3.metric("日均对话轮次", m.get("turns_per_day", 0))
+    d4.metric("情绪记录连续性", "%s 天/周" % (m.get("diary_days", 0) or 0))
+    st.caption("口径说明见《研究方案》第 4 节。主动周留存 = 一周内跨 ≥2 天打开的人数占比；"
+               "首周激活 = 注册后 7 天内首次记录情绪的比例。样本量小于 20 时比率波动很大，不宜下结论。")
+
+    st.markdown("#### 三、安全流程执行情况")
+    e1, e2, e3, e4 = st.columns(4)
+    e1.metric("近 7 天 L2/L3 触发", (m.get("crisis_l2_7d", 0) or 0) + (m.get("crisis_l3_7d", 0) or 0))
+    e2.metric("未关闭警报", m.get("alert_open", 0))
+    e3.metric("已关闭警报", m.get("alert_closed", 0))
+    e4.metric("平均响应时长（分钟）", m.get("alert_median_minutes", 0))
+    st.caption("这里只报**数量**与**流程时效**，不报内容。具体个案由研究者按《危机响应 SOP》"
+               "单独向您汇报，且遵循知情同意的范围。")
+
+    st.markdown("#### 四、结论与下一步")
+    base = m.get("week_retention_base", 0) or 0
+    act_base = m.get("activation_base", 0) or 0
+    if base == 0 and act_base == 0:
+        st.info("尚未进入正式观察期：还没有满一周的 cohort。")
+    else:
+        lines = []
+        if act_base:
+            lines.append("首周激活率 %s%%（止损线 30%%）" % (m.get("activation_7d", 0) or 0))
+        if base:
+            lines.append("主动周留存 %s%%（阈值 25%%）" % (m.get("week_retention", 0) or 0))
+        st.markdown("本期关键读数：" + "；".join(lines) + "。")
+
+    st.caption("生成时间：%s ｜ 数据来源：客户端埋点（不含任何内容字段）"
+               % _esc(m.get("generated_at", "-")))
+
+    # 导出：给老师的那份，永远只有聚合数
+    agg = pd.DataFrame([
+        {"指标": "周活跃用户", "数值": m.get("wau", 0)},
+        {"指标": "月活跃用户", "数值": m.get("mau", 0)},
+        {"指标": "主动周留存率(%)", "数值": m.get("week_retention", 0)},
+        {"指标": "首周激活率(%)", "数值": m.get("activation_7d", 0)},
+        {"指标": "日均对话轮次", "数值": m.get("turns_per_day", 0)},
+        {"指标": "情绪记录连续性(天/周)", "数值": m.get("diary_days", 0)},
+        {"指标": "L2触发(7天)", "数值": m.get("crisis_l2_7d", 0)},
+        {"指标": "L3触发(7天)", "数值": m.get("crisis_l3_7d", 0)},
+        {"指标": "未关闭警报", "数值": m.get("alert_open", 0)},
+        {"指标": "已关闭警报", "数值": m.get("alert_closed", 0)},
+        {"指标": "响应时长中位数(分钟)", "数值": m.get("alert_median_minutes", 0)},
+    ])
+    st.download_button("导出校方汇总 CSV（无个人数据）", _csv_safe(agg).to_csv(index=False).encode("utf-8-sig"),
+                       file_name="heart-stars-school-summary.csv", mime="text/csv")
+
+
 
 
 def render():
@@ -404,20 +841,37 @@ def render():
         _login_screen()
         return
 
+    # 闲置超时：后台能看到全站最敏感的内容，离开电脑就必须自己锁上
+    seen = float(st.session_state.get("admin_seen") or 0)
+    if seen and (time.time() - seen) > IDLE_TIMEOUT_SEC:
+        st.session_state.admin_ok = False
+        st.session_state.admin_api = None
+        st.warning("闲置超过 30 分钟，已自动退出，请重新登录。")
+        _login_screen()
+        return
+    st.session_state.admin_seen = time.time()
+
     with st.sidebar:
         st.markdown("### 心与星寻 · 后台")
-        st.caption("管理员：%s" % _creds()[0])
+        st.caption("管理员：%s" % (_creds()[0] or "—"))
         st.session_state.admin_page = st.radio("功能", PAGES,
                                                index=PAGES.index(st.session_state.get("admin_page", "总览")))
         st.divider()
         if st.button("退出登录"):
             st.session_state.admin_ok = False
+            st.session_state.admin_api = None
+            st.session_state.admin_uid = None
+            _clear_failures()
             st.rerun()
 
     api = _api()
     page = st.session_state.get("admin_page", "总览")
     if page == "总览":
         _page_overview(api)
+    elif page == "周度看板":
+        _page_metrics(api)
+    elif page == "校方视图":
+        _page_school(api)
     elif page == "用户管理":
         _page_users(api)
     elif page == "用户详情":

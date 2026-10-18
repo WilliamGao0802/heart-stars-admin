@@ -10,8 +10,20 @@ from .cloud import CloudClient, CloudError
 
 
 def default_admin_key():
-    """优先取环境变量 / Streamlit Secrets，没有则用项目既定密钥。"""
-    return os.environ.get("HSX_ADMIN_KEY", "gld20080802")
+    """只从环境变量读取。**不再有内置默认值**。
+
+    安全要求：密钥一旦写进源码，就等于把全站数据（日记、对话、记忆）
+    的读权限一起公开——仓库可能被分享、被 fork、被打包上传。
+    所以缺配置时宁可报错停摆，也不退化成弱口令。
+    """
+    key = os.environ.get("HSX_ADMIN_KEY", "").strip()
+    if not key:
+        raise AdminError(
+            "未配置 HSX_ADMIN_KEY。请在 .streamlit/secrets.toml 的 [admin].db_key "
+            "或环境变量里提供管理密钥。",
+            "no_key",
+        )
+    return key
 
 
 def make_admin_client(key=None):
@@ -44,6 +56,9 @@ class AdminAPI:
     def stats(self):
         return self._rpc("admin_stats") or {}
 
+    def metrics(self):
+        return self._rpc("admin_metrics") or {}
+
     def users(self, q="", limit=200, offset=0):
         return self._rpc("admin_users", {"p_limit": limit, "p_offset": offset, "p_q": q}) or []
 
@@ -52,6 +67,24 @@ class AdminAPI:
 
     def alerts(self, limit=200):
         return self._rpc("admin_alerts_list", {"p_limit": limit}) or []
+
+    def alert_update(self, alert_id, status, handler="", note="", referral_path=""):
+        """推进警报台账状态（唯一允许后台写库的入口）。
+
+        白名单只有四个字段，时间戳由服务端按状态自动落 —— 客户端传时间会被伪造，
+        所以这里刻意不开放 created_at / acked_at 之类的参数。
+        """
+        if status not in ("open", "acked", "referred", "closed"):
+            raise AdminError("非法的状态值：%s" % status, "bad_status")
+        if not str(handler or "").strip():
+            raise AdminError("必须填写处理人（台账要能回答「谁处理了」）", "no_handler")
+        return self._rpc("admin_alert_update", {
+            "p_id": int(alert_id),
+            "p_status": status,
+            "p_handler": str(handler).strip(),
+            "p_note": str(note or "").strip(),
+            "p_referral_path": str(referral_path or "").strip(),
+        }) or {}
 
     def library(self, q="", limit=800):
         return self._rpc("admin_library", {"p_q": q, "p_limit": limit}) or []
