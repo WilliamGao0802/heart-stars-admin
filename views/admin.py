@@ -24,7 +24,21 @@ import streamlit as st
 
 from core.admin import AdminAPI, AdminError
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
+
+# 侧栏功能清单。顺序即信息架构：先看总量，再看结构（占比/时段），
+# 然后才是「校方视图」这类对外口径页，最后是逐人排查类页面。
+PAGES = [
+    "总览",
+    "周度看板",
+    "数量占比",
+    "校方视图",
+    "用户管理",
+    "用户详情",
+    "警报中心",
+    "回应库",
+    "系统自检",
+]
 
 
 # ============================ 输出转义 ============================
@@ -735,9 +749,103 @@ def _page_health(api):
     st.caption("版本 v%s" % VERSION)
 
 
-# ============================ 入口 ============================
+# ============================ 数量占比 ============================
+#
+# PPT P12 的追问是「第八周还剩多少人」；投资对话的追问是「四端有没有同一个系统」。
+# 这一页用**占比**回答这两问：四端分布（是不是真的同源）、活跃度分层（用到什么深度）、
+# 对话轮次分布（浅聊还是深聊）、留存（还剩多少）、时段分布（是不是深夜来用）。
+#
+# 数据源只有 admin_metrics（纯聚合 RPC）——这一页虽然管理员可见，
+# 但保持"不含个人级内容"的习惯，整页可以直接截图进汇报。
 
-PAGES = ["总览", "周度看板", "校方视图", "用户管理", "用户详情", "警报中心", "回应库", "系统自检"]
+def _page_share(api):
+    m, err = _run(api.metrics)
+    if err:
+        st.error("数据暂不可用：%s" % _esc(err))
+        return
+
+    st.markdown("### 数量占比")
+    st.caption("回答两件事：四端是不是同一个系统、用户用到了什么深度。数据全部来自 admin_metrics 聚合接口，"
+               "本页不出现任何个人标识，可直接截图放进汇报材料。")
+
+    # ---- 一、四端分布 ----
+    st.markdown("#### 一、客户端分布（近 7 天活跃）")
+    plat = m.get("platforms") or {}
+    if plat:
+        names = {"h5": "网页 H5", "mp": "微信小程序", "app": "安卓 App", "st": "网页版（桌面）", "unknown": "未标注"}
+        total = sum(plat.values()) or 1
+        rows = [{"端": names.get(k, k), "人数": v, "占比": "%s%%" % round(v * 100 / total, 1)}
+                for k, v in sorted(plat.items(), key=lambda x: -x[1])]
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            st.bar_chart(pd.DataFrame({"人数": {names.get(k, k): v for k, v in plat.items()}}))
+        with c2:
+            st.metric("覆盖端数", "%d / 4" % len([k for k in plat if k in ("h5", "mp", "app", "st")]))
+        st.caption("四个端都应出现——出现「未标注」说明有旧版客户端还在跑，升级后一周内应消失。")
+    else:
+        st.caption("还没有埋点数据。")
+
+    # ---- 二、活跃度分层 ----
+    st.markdown("#### 二、活跃度分层（全部注册用户）")
+    stats, serr = _run(api.stats)
+    if not serr and stats:
+        users = stats.get("users", 0) or 0
+        layered = pd.DataFrame({
+            "层级": ["只注册（看过就走）", "写过日记", "聊过天", "有长期记忆（≥10 轮）"],
+            "人数": [users, stats.get("diaries", 0), stats.get("messages", 0), stats.get("memory", 0)],
+        })
+        st.dataframe(layered, width="stretch", hide_index=True)
+        st.caption("注意四行**不是互斥**的：一个人可以同时写日记和聊天。这张表看的是「每个功能被用到的深度」，"
+                   "不是把人分类。用户总数 %d。" % users)
+
+    # ---- 三、对话轮次分布 ----
+    st.markdown("#### 三、对话深度（有对话的用户轮次分布）")
+    turns, terr = _run(api.turn_distribution)
+    buckets = (turns or {}).get("buckets") or []
+    if terr:
+        st.caption("轮次分布接口未部署（admin_turn_distribution），不影响其它页面。")
+    elif buckets:
+        df = pd.DataFrame([{"档位": b.get("label"), "人数": b.get("users", 0)} for b in buckets])
+        df["占比"] = df["人数"].apply(lambda v: "%s%%" % round(v * 100 / (sum(df["人数"]) or 1), 1))
+        st.bar_chart(df.set_index("档位")[["人数"]])
+        st.dataframe(df, width="stretch", hide_index=True)
+        st.caption("P9 的承诺是「先接住情绪」——1–5 轮是浅聊，21 轮以上说明真的有人把它当树洞。")
+    else:
+        st.info("还没有人聊过天（chat_messages 里没有 role=user 的记录）。这张表会在第一批对话出现后自动长出来。")
+
+    # ---- 四、留存 ----
+    st.markdown("#### 四、留存（回答 P12：第八周还剩多少人）")
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("次日留存", "%s%%" % (m.get("retention_d1", 0) or 0))
+    d2.metric("7 日留存", "%s%%" % (m.get("retention_d7", 0) or 0))
+    d3.metric("14 日留存", "%s%%" % (m.get("retention_d14", 0) or 0))
+    d4.metric("30 日留存", "%s%%" % (m.get("retention_d30", 0) or 0))
+    st.caption("第 8 周（56 天）留存要等数据积累满 8 周——现在显示的每一天都是在给那个数打地基。")
+
+    # ---- 五、时段分布 ----
+    st.markdown("#### 五、时段分布（近 7 天活跃）")
+    hours, herr = _run(api.hour_distribution)
+    hrows = (hours or {}).get("hours") or []
+    if herr:
+        st.caption("时段分布接口未部署（admin_hour_distribution），不影响其它页面。")
+    elif hrows:
+        # 补齐 0–23 全时段，否则没人的小时在图上直接消失，看起来像"没有凌晨使用"
+        got = {int(r.get("h", 0)): int(r.get("n", 0)) for r in hrows}
+        df = pd.DataFrame({"hour": list(range(24))})
+        df["次数"] = df["hour"].map(lambda h: got.get(h, 0))
+        df["时段"] = df["hour"].apply(lambda h: "%02d" % h)
+        st.bar_chart(df.set_index("时段")[["次数"]])
+        deep = int(df[df["hour"].between(0, 5)]["次数"].sum())
+        alln = int(df["次数"].sum()) or 1
+        st.metric("凌晨 0–6 点占比", "%s%%" % round(deep * 100 / alln, 1),
+                  help="P9 的场景「凌晨两点想说话」有多少是真的——这个数字直接回答它。")
+        st.caption("数据源：app_open 埋点（每端每天去重一次），时区按 Asia/Shanghai。")
+    else:
+        st.info("近 7 天还没有 app_open 埋点。")
+
+
+
 
 
 # ============================ 校方视图（P12：师生物理隔离）============================
@@ -870,6 +978,8 @@ def render():
         _page_overview(api)
     elif page == "周度看板":
         _page_metrics(api)
+    elif page == "数量占比":
+        _page_share(api)
     elif page == "校方视图":
         _page_school(api)
     elif page == "用户管理":

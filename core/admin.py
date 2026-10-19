@@ -89,6 +89,14 @@ class AdminAPI:
     def library(self, q="", limit=800):
         return self._rpc("admin_library", {"p_q": q, "p_limit": limit}) or []
 
+    def turn_distribution(self):
+        """对话轮次档位分布（数量占比页）。云端未部署时 AdminError(no_rpc)。"""
+        return self._rpc("admin_turn_distribution") or {}
+
+    def hour_distribution(self):
+        """近 7 天活跃的时段分布（数量占比页）。云端未部署时 AdminError(no_rpc)。"""
+        return self._rpc("admin_hour_distribution") or {}
+
     def ping(self):
         try:
             return self.client.rpc("admin_stats", {"p_key": self.key}) is not None

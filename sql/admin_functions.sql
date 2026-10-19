@@ -455,3 +455,99 @@ $$;
 
 REVOKE ALL ON FUNCTION public.admin_alert_update(text, bigint, text, text, text, text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION public.admin_alert_update(text, bigint, text, text, text, text) TO anon, authenticated;
+
+
+-- ============================================================
+-- v0.12.0 追加：数量占比页两个聚合函数（与 v0120_share_distribution.sql 逐字一致）
+-- ============================================================
+
+-- ============ 1. 对话轮次档位分布 ============
+-- 口径：按 owner_id 聚合 chat_messages 里 role='user' 的条数（一个用户轮数 = 他发过多少条），
+--      档位 [1-5, 6-20, 21-50, 50+]。不含 administrator。
+CREATE OR REPLACE FUNCTION public.admin_turn_distribution(p_key text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_hash text;
+BEGIN
+  SELECT v INTO v_hash FROM public.app_config WHERE k = 'admin_key_hash';
+  IF v_hash IS NULL
+     OR encode(digest(coalesce(p_key, ''), 'sha256'), 'hex') != v_hash THEN
+    RAISE EXCEPTION 'forbidden' USING ERRCODE = 'P0001';
+  END IF;
+
+  RETURN jsonb_build_object(
+    'buckets', (
+      SELECT coalesce(jsonb_agg(x ORDER BY x.idx), '[]'::jsonb) FROM (
+        SELECT
+          CASE
+            WHEN n BETWEEN 1  AND 5  THEN 0
+            WHEN n BETWEEN 6  AND 20 THEN 1
+            WHEN n BETWEEN 21 AND 50 THEN 2
+            ELSE 3
+          END AS idx,
+          CASE
+            WHEN n BETWEEN 1  AND 5  THEN '1-5 轮'
+            WHEN n BETWEEN 6  AND 20 THEN '6-20 轮'
+            WHEN n BETWEEN 21 AND 50 THEN '21-50 轮'
+            ELSE '50 轮以上'
+          END AS label,
+          count(*) AS users
+        FROM (
+          SELECT owner_id, count(*) AS n
+          FROM public.chat_messages
+          WHERE role = 'user' AND owner_id IS NOT NULL
+          GROUP BY owner_id
+        ) t
+        GROUP BY 1, 2
+      ) x
+    ),
+    'generated_at', now()
+  );
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.admin_turn_distribution(text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.admin_turn_distribution(text) TO anon, authenticated;
+
+
+-- ============ 2. 时段分布（近 7 天，按北京时间） ============
+-- 口径：analytics_events 里 event='app_open'（打开即活跃），
+--      按 created_at 转 Asia/Shanghai 后的小时聚合。0–6 时合计即「凌晨占比」分子。
+CREATE OR REPLACE FUNCTION public.admin_hour_distribution(p_key text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+  v_hash text;
+BEGIN
+  SELECT v INTO v_hash FROM public.app_config WHERE k = 'admin_key_hash';
+  IF v_hash IS NULL
+     OR encode(digest(coalesce(p_key, ''), 'sha256'), 'hex') != v_hash THEN
+    RAISE EXCEPTION 'forbidden' USING ERRCODE = 'P0001';
+  END IF;
+
+  RETURN jsonb_build_object(
+    'hours', (
+      SELECT coalesce(jsonb_agg(x ORDER BY x.h), '[]'::jsonb) FROM (
+        SELECT
+          extract(hour FROM (created_at AT TIME ZONE 'Asia/Shanghai'))::int AS h,
+          count(*) AS n
+        FROM public.analytics_events
+        WHERE event = 'app_open'
+          AND created_at >= now() - interval '7 days'
+        GROUP BY 1
+      ) x
+    ),
+    'generated_at', now()
+  );
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.admin_hour_distribution(text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.admin_hour_distribution(text) TO anon, authenticated;
